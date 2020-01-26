@@ -4,6 +4,7 @@
  *
  * Copyright (c) 2015 Natanael Copa <ncopa@alpinelinux.org>
  * Copyright (c) 2016 Timo Teräs <timo.teras@iki.fi>
+ * Copyright (c) 2020 Angel <angel@ttm.sh>
  */
 
 #ifndef _GNU_SOURCE
@@ -23,6 +24,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <math.h>
 
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
@@ -33,12 +35,18 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
 
 #include <linux/netlink.h>
+#include <linux/types.h>
+#include <linux/ioctl.h>
+#include <linux/fb.h>
 
 #include <libkmod.h>
 #include <blkid.h>
 #include <libcryptsetup.h>
+#include <cairo/cairo.h>
 
 #include "arg.h"
 
@@ -307,6 +315,104 @@ static int spawn_active(struct spawn_manager *mgr)
 	return mgr->num_running || !list_empty(&mgr->queue);
 }
 
+struct cairo_fb_dev {
+    int fd;
+    char *data;
+    size_t size;
+    struct fb_var_screeninfo vinfo;
+    struct fb_fix_screeninfo finfo;
+};
+
+static void cairo_fb_surface_destroy(void *dev_p)
+{
+    struct cairo_fb_dev *dev = (struct cairo_fb_dev *) dev_p;   
+
+    if (dev == NULL)
+        return;
+
+    munmap(dev->data, dev->size);
+    close(dev->fd);
+    free(dev);
+}
+
+cairo_surface_t *cairo_fb_surface_create(const char *fb_name)
+{
+    struct cairo_fb_dev *dev;
+    cairo_surface_t *surface;
+
+    dev = malloc(sizeof(*dev));
+    if (!dev) {
+        perror("error: cannot allocate memory");
+        _exit(1);
+    }
+
+    dev->fd = open(fb_name, O_RDWR);
+    if (dev->fd == -1) {
+        perror("error: cannot open framebuffer device");
+        goto allocate_error;
+    }
+
+    if (ioctl(dev->fd, FBIOGET_VSCREENINFO, &dev->vinfo) == -1) {
+        perror("error: cannot read variable screen information");
+        goto ioctl_error;
+    }
+
+    dev->size = dev->vinfo.xres * dev->vinfo.yres * dev->vinfo.bits_per_pixel / 8;
+    dev->data = (char *) mmap(0, dev->size, PROT_READ | PROT_WRITE, MAP_SHARED, dev->fd, 0);
+    if ((intptr_t) dev->data == -1) {
+        perror("error: cannot map framebuffer device to memory");
+        goto ioctl_error;
+    }
+
+    if (ioctl(dev->fd, FBIOGET_FSCREENINFO, &dev->finfo) == -1) {
+        perror("error: cannot read fixed screen information");
+        goto ioctl_error;
+    }
+
+    surface = cairo_image_surface_create_for_data((unsigned char *)dev->data,
+                CAIRO_FORMAT_RGB24,
+                dev->vinfo.xres,
+                dev->vinfo.yres,
+                cairo_format_stride_for_width(CAIRO_FORMAT_RGB24,
+                                              dev->vinfo.xres));
+    cairo_surface_set_user_data(surface, NULL, dev, &cairo_fb_surface_destroy);
+    return surface;
+
+ioctl_error:
+    close(dev->fd);
+allocate_error:
+    free(dev);
+    _exit(1);
+}
+
+static void render_ring(cairo_t *cr, struct cairo_fb_dev *dev,
+                        double r, double g, double b,
+                        int rand_arc)
+{
+    static double hl_start;
+    double x, y;
+
+    cairo_set_operator(cr, CAIRO_OPERATOR_CLEAR);
+    cairo_paint(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
+
+    x = (double) dev->vinfo.xres / 2;
+    y = (double) dev->vinfo.yres / 2;
+
+    cairo_move_to(cr, x + 64.0, y);
+    cairo_set_line_width(cr, 3.0);
+    cairo_set_source_rgb(cr, r/3.0, g/3.0, b/3.0);
+    cairo_arc(cr, x, y, 64.0, 0, 2*M_PI);
+    cairo_stroke(cr);
+
+    if (rand_arc) {
+        hl_start += (rand() % (int) (M_PI*100)) / 100.0 + M_PI*0.5;
+        cairo_set_source_rgb(cr, r, g, b);
+        cairo_arc(cr, x, y, 64.0, hl_start, hl_start + M_PI/3.0);
+        cairo_stroke(cr);
+    }
+}
+
 struct cryptdev {
 	char *device;
 	char *name;
@@ -516,43 +622,6 @@ static void start_zpool(char *uuid) {
 		spawn_command(&spawnmgr, zpool_argv, 0);
 }
 
-static int read_pass(char *pass, size_t pass_size)
-{
-	struct termios old_flags, new_flags;
-	int r;
-
-	tcgetattr(STDIN_FILENO, &old_flags);
-	new_flags = old_flags;
-	new_flags.c_lflag &= ~ECHO;
-	new_flags.c_lflag |= ECHONL;
-
-	if (isatty(STDIN_FILENO)) {
-		r = tcsetattr(STDIN_FILENO, TCSANOW, &new_flags);
-		if (r < 0) {
-			warn("tcsetattr");
-			return r;
-		}
-	}// else {
-	//	fprintf(stderr, "The program isn't executed in a TTY, the echo-disabling has been skipped.\n");
-	//}
-
-	if (fgets(pass, pass_size, stdin) == NULL) {
-		warn("fgets");
-		return -1;
-	}
-	pass[strlen(pass) - 1] = '\0';
-
-	if (isatty(STDIN_FILENO)) {
-		if (tcsetattr(STDIN_FILENO, TCSANOW, &old_flags) < 0) {
-			warn("tcsetattr");
-		}
-	}// else {
-	//	fprintf(stderr, "The program isn't executed in a TTY, the echo-reenabling has been skipped.\n");
-	//}
-
-	return 0;
-}
-
 static void notify_main(struct ueventconf *conf)
 {
 	uint64_t one = 1;
@@ -608,14 +677,46 @@ static void *cryptsetup_thread(void *data)
 			goto free_out;
 	}
 
-	while (passwd_tries > 0) {
+    cairo_surface_t *splash_surface;
+    struct cairo_fb_dev *splash_dev;
+    cairo_t *splash_cr;
+    struct termios old_tio, new_tio;
+
+    splash_surface = cairo_fb_surface_create("/dev/fb0");
+    splash_dev = cairo_surface_get_user_data(splash_surface, NULL);
+    splash_cr = cairo_create(splash_surface);
+
+    printf("\e[?25l"); /* disable cursor */
+    fflush(stdout);
+    tcgetattr(STDIN_FILENO, &old_tio);
+    new_tio = old_tio;
+    new_tio.c_lflag &= ~ICANON & ~ECHO;
+    tcsetattr(STDIN_FILENO, TCSANOW, &new_tio);
+    
+    while (passwd_tries > 0) {
 		char pass[1024];
+		size_t n = 0;
+		char ch;
 
-		printf("Enter passphrase for %s: ", c->crypt.data.devnode);
-		fflush(stdout);
+        render_ring(splash_cr, splash_dev, 1.0, 1.0, 1.0, 0);
+		while ((ch = getc(stdin)) != '\n') {
+    		if (ch == '\b') {
+                /* backspace */
+                if (n > 0) {
+                    pass[n--] = '\0';
+                    if (n == 0)
+                        render_ring(splash_cr, splash_dev, 1.0, 1.0, 1.0, 0);
+                }
+            } else {
+                pass[n++] = ch;
+                if (n == sizeof(pass) - 1)
+                    break;
+                render_ring(splash_cr, splash_dev, 1.0, 1.0, 1.0, 1);
+    		}
+		}
 
-		if (read_pass(pass, sizeof(pass)) < 0)
-			goto free_out;
+		render_ring(splash_cr, splash_dev, 0.0, 1.0, 1.0, 0);
+		pass[n] = '\0';
 		passwd_tries--;
 
 		pthread_mutex_lock(&c->crypt.mutex);
@@ -626,12 +727,23 @@ static void *cryptsetup_thread(void *data)
 		pthread_mutex_unlock(&c->crypt.mutex);
 		memset(pass, 0, sizeof(pass)); /* wipe pass after use */
 
-		if (r >= 0)
-			goto free_out;
-		printf("No key available with this passphrase.\n");
-	}
-	printf("Mounting %s failed, amount of tries exhausted.\n", c->crypt.data.devnode);
+		if (r >= 0) {
+    		render_ring(splash_cr, splash_dev, 0.0, 1.0, 0.0, 0);
+			goto splash_out;
+		}
 
+		render_ring(splash_cr, splash_dev, 1.0, 0.0, 0.0, 0);
+		sleep(5);
+	}
+
+    render_ring(splash_cr, splash_dev, 1.0, 0.0, 0.0, 0);
+    sleep(5);
+splash_out:
+    cairo_destroy(splash_cr);
+    cairo_surface_destroy(splash_surface);
+    tcsetattr(STDIN_FILENO, TCSANOW, &old_tio);
+    printf("\e[?25h"); /* reenable cursor */
+    fflush(stdout);
 free_out:
 	crypt_free(cd);
 notify_out:

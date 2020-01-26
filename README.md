@@ -3,6 +3,8 @@
 This is the initramfs generator for Alpine Linux, including support for apk and 
 Alpine Diskless boot.
 
+This fork also displays a graphical prompt for decrypting disks, using cairo on the framebuffer.
+
 ## Dependencies
 
 To compile manually, you need to have the following build tools available:
@@ -15,6 +17,7 @@ nlplug-findfs will link against the following libraries (runtime deps):
 - libkmod
 - libblkid (from util-linux)
 - libcryptsetup
+- cairo
 
 ## Installation
 

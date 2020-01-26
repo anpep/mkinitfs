@@ -1,5 +1,5 @@
 
-VERSION		:= 3.4.4
+VERSION		:= 3.4.4-graphical
 
 sbindir		?= /sbin
 sysconfdir	?= /etc/mkinitfs
@@ -105,9 +105,11 @@ LIBKMOD_CFLAGS	:= $(shell $(PKGCONF) --cflags libkmod)
 LIBKMOD_LIBS	:= $(shell $(PKGCONF) --libs libkmod)
 CRYPTSETUP_CFLAGS := $(shell $(PKGCONF) --cflags libcryptsetup)
 CRYPTSETUP_LIBS	:= $(shell $(PKGCONF) --libs libcryptsetup)
+CAIRO_CFLAGS    := $(shell $(PKGCONF) --cflags cairo)
+CAIRO_LIBS      := $(shell $(PKGCONF) --libs cairo)
 
-CFLAGS		+= $(BLKID_CFLAGS) $(LIBKMOD_CFLAGS) $(CRYPTSETUP_CFLAGS)
-LIBS		= $(BLKID_LIBS) $(LIBKMOD_LIBS) $(CRYPTSETUP_LIBS)
+CFLAGS		+= $(BLKID_CFLAGS) $(LIBKMOD_CFLAGS) $(CRYPTSETUP_CFLAGS) $(CAIRO_CFLAGS)
+LIBS		= $(BLKID_LIBS) $(LIBKMOD_LIBS) $(CRYPTSETUP_LIBS) $(CAIRO_LIBS)
 
 %.o: %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ -c $<
